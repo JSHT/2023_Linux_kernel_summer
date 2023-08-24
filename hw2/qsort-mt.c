@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cond.h"
+#include "futex.h"
+#include "mutex.h"
+
 #define verify(x)                                                      \
     do {                                                               \
         int e;                                                         \
@@ -86,26 +90,26 @@ enum thread_state {
 
 /* Variant part passed to qsort invocations. */
 struct qsort {
-    enum thread_state st;   /* For coordinating work. */
-    struct common *common;  /* Common shared elements. */
-    void *a;                /* Array base. */
-    size_t n;               /* Number of elements. */
-    pthread_t id;           /* Thread id. */
-    pthread_mutex_t mtx_st; /* For signalling state change. */
-    pthread_cond_t cond_st; /* For signalling state change. */
+    enum thread_state st;  /* For coordinating work. */
+    struct common *common; /* Common shared elements. */
+    void *a;               /* Array base. */
+    size_t n;              /* Number of elements. */
+    pthread_t id;          /* Thread id. */
+    mutex_t ftx_st;        /* For signalling state change. */
+    cond_t fcond_st;       /* For signalling state change. */
 };
 
 /* Invariant common part, shared across invocations. */
 struct common {
-    int swaptype;           /* Code to use for swapping */
-    size_t es;              /* Element size. */
-    void *thunk;            /* Thunk for qsort_r */
-    cmp_t *cmp;             /* Comparison function */
-    int nthreads;           /* Total number of pool threads. */
-    int idlethreads;        /* Number of idle threads in pool. */
-    int forkelem;           /* Minimum number of elements for a new thread. */
-    struct qsort *pool;     /* Fixed pool of threads. */
-    pthread_mutex_t mtx_al; /* For allocating threads in the pool. */
+    int swaptype;       /* Code to use for swapping */
+    size_t es;          /* Element size. */
+    void *thunk;        /* Thunk for qsort_r */
+    cmp_t *cmp;         /* Comparison function */
+    int nthreads;       /* Total number of pool threads. */
+    int idlethreads;    /* Number of idle threads in pool. */
+    int forkelem;       /* Minimum number of elements for a new thread. */
+    struct qsort *pool; /* Fixed pool of threads. */
+    mutex_t ftx_al;     /* For allocating threads in the pool. */
 };
 
 static void *qsort_thread(void *p);
@@ -127,23 +131,16 @@ void qsort_mt(void *a,
         goto f1;
     errno = 0;
     /* Try to initialize the resources we need. */
-    if (pthread_mutex_init(&c.mtx_al, NULL) != 0)
-        goto f1;
+    mutex_init(&c.ftx_al);
     if ((c.pool = calloc(maxthreads, sizeof(struct qsort))) == NULL)
         goto f2;
     for (islot = 0; islot < maxthreads; islot++) {
         qs = &c.pool[islot];
-        if (pthread_mutex_init(&qs->mtx_st, NULL) != 0)
-            goto f3;
-        if (pthread_cond_init(&qs->cond_st, NULL) != 0) {
-            verify(pthread_mutex_destroy(&qs->mtx_st));
-            goto f3;
-        }
+        mutex_init(&qs->ftx_st);
+        cond_init(&qs->fcond_st);
         qs->st = ts_idle;
         qs->common = &c;
         if (pthread_create(&qs->id, NULL, qsort_thread, qs) != 0) {
-            verify(pthread_mutex_destroy(&qs->mtx_st));
-            verify(pthread_cond_destroy(&qs->cond_st));
             goto f3;
         }
     }
@@ -163,31 +160,28 @@ void qsort_mt(void *a,
 
     /* Hand out the first work batch. */
     qs = &c.pool[0];
-    verify(pthread_mutex_lock(&qs->mtx_st));
+    mutex_lock(&qs->ftx_st);
     qs->a = a;
     qs->n = n;
     qs->st = ts_work;
     c.idlethreads--;
-    verify(pthread_cond_signal(&qs->cond_st));
-    verify(pthread_mutex_unlock(&qs->mtx_st));
+    cond_signal(&qs->fcond_st, &qs->ftx_st);
+    mutex_unlock(&qs->ftx_st);
 
     /* Wait for all threads to finish, and free acquired resources. */
 f3:
     for (i = 0; i < islot; i++) {
         qs = &c.pool[i];
         if (bailout) {
-            verify(pthread_mutex_lock(&qs->mtx_st));
+            mutex_lock(&qs->ftx_st);
             qs->st = ts_term;
-            verify(pthread_cond_signal(&qs->cond_st));
-            verify(pthread_mutex_unlock(&qs->mtx_st));
+            cond_signal(&qs->fcond_st, &qs->ftx_st);
+            mutex_unlock(&qs->ftx_st);
         }
         verify(pthread_join(qs->id, NULL));
-        verify(pthread_mutex_destroy(&qs->mtx_st));
-        verify(pthread_cond_destroy(&qs->cond_st));
     }
     free(c.pool);
 f2:
-    verify(pthread_mutex_destroy(&c.mtx_al));
     if (bailout) {
         fprintf(stderr, "Resource initialization failed; bailing out.\n");
     f1:
@@ -204,16 +198,16 @@ f2:
  */
 static struct qsort *allocate_thread(struct common *c)
 {
-    verify(pthread_mutex_lock(&c->mtx_al));
+    mutex_lock(&c->ftx_al);
     for (int i = 0; i < c->nthreads; i++)
         if (c->pool[i].st == ts_idle) {
             c->idlethreads--;
-            verify(pthread_mutex_lock(&c->pool[i].mtx_st));
+            mutex_lock(&c->pool[i].ftx_st);
             c->pool[i].st = ts_work;
-            verify(pthread_mutex_unlock(&c->mtx_al));
+            mutex_unlock(&c->ftx_al);
             return (&c->pool[i]);
         }
-    verify(pthread_mutex_unlock(&c->mtx_al));
+    mutex_unlock(&c->ftx_al);
     return (NULL);
 }
 
@@ -314,8 +308,8 @@ nevermind:
         (qs2 = allocate_thread(c)) != NULL) {
         qs2->a = a;
         qs2->n = nl;
-        verify(pthread_cond_signal(&qs2->cond_st));
-        verify(pthread_mutex_unlock(&qs2->mtx_st));
+        cond_signal(&qs2->fcond_st, &qs2->ftx_st);
+        mutex_unlock(&qs2->ftx_st);
     } else if (nl > 0) {
         qs->a = a;
         qs->n = nl;
@@ -339,10 +333,10 @@ static void *qsort_thread(void *p)
     c = qs->common;
 again:
     /* Wait for work to be allocated. */
-    verify(pthread_mutex_lock(&qs->mtx_st));
+    mutex_lock(&qs->ftx_st);
     while (qs->st == ts_idle)
-        verify(pthread_cond_wait(&qs->cond_st, &qs->mtx_st));  // HHHH
-    verify(pthread_mutex_unlock(&qs->mtx_st));
+        cond_wait(&qs->fcond_st, &qs->ftx_st);  // HHHH
+    mutex_unlock(&qs->ftx_st);
     if (qs->st == ts_term) {
         return NULL;
     }
@@ -350,7 +344,7 @@ again:
 
     qsort_algo(qs);
 
-    verify(pthread_mutex_lock(&c->mtx_al));
+    mutex_lock(&c->ftx_al);
     qs->st = ts_idle;
     c->idlethreads++;
     if (c->idlethreads == c->nthreads) {
@@ -358,15 +352,15 @@ again:
             qs2 = &c->pool[i];
             if (qs2 == qs)
                 continue;
-            verify(pthread_mutex_lock(&qs2->mtx_st));
+            mutex_lock(&qs2->ftx_st);
             qs2->st = ts_term;
-            verify(pthread_cond_signal(&qs2->cond_st));  // JJJJ
-            verify(pthread_mutex_unlock(&qs2->mtx_st));
+            cond_signal(&qs2->fcond_st, &qs2->ftx_st);  // JJJJ
+            mutex_unlock(&qs2->ftx_st);
         }
-        verify(pthread_mutex_unlock(&c->mtx_al));
+        mutex_unlock(&c->ftx_al);
         return NULL;
     }
-    verify(pthread_mutex_unlock(&c->mtx_al));
+    mutex_unlock(&c->ftx_al);
     goto again;
 }
 
